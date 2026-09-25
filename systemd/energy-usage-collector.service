@@ -1,0 +1,14 @@
+[Unit]
+Description=Energy usage collector (per-program energy statistics)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/energy-usage-collector run
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

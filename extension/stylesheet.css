@@ -1,0 +1,68 @@
+.euo-panel-label {
+  padding-left: 4px;
+}
+
+.euo-header {
+  font-weight: bold;
+}
+
+.euo-subtitle {
+  font-size: 0.85em;
+  color: #999;
+}
+
+.euo-periods {
+  spacing: 4px;
+  padding: 4px 12px;
+}
+
+.euo-period-button {
+  padding: 4px 10px;
+  border-radius: 99px;
+  font-size: 0.9em;
+}
+
+.euo-period-button:checked {
+  background-color: #3584e4;
+  color: #ffffff;
+}
+
+.euo-row {
+  spacing: 8px;
+  min-width: 340px;
+}
+
+.euo-row-name {
+  font-weight: normal;
+}
+
+.euo-row-value {
+  font-feature-settings: "tnum";
+  text-align: right;
+  min-width: 70px;
+}
+
+.euo-row-percent {
+  font-size: 0.85em;
+  color: #999;
+  min-width: 42px;
+  text-align: right;
+}
+
+.euo-bar-trough {
+  width: 180px;
+  height: 4px;
+  border-radius: 2px;
+  background-color: rgba(128, 128, 128, 0.25);
+  margin-top: 2px;
+}
+
+.euo-bar {
+  height: 4px;
+  border-radius: 2px;
+  background-color: #3584e4;
+}
+
+.euo-warning {
+  color: #e5a50a;
+}

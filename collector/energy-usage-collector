@@ -1,0 +1,569 @@
+#!/usr/bin/python3
+"""Energy usage collector.
+
+Samples per-process CPU time from /proc and the system power draw from the
+best available source (Intel RAPL, battery discharge rate, or a CPU-load based
+estimate). The measured energy of every sample interval is split between the
+processes proportionally to the CPU time they consumed in that interval and
+aggregated per application.
+
+Aggregates are stored in SQLite (per minute for the last hours, per hour for
+the last weeks) and a small JSON summary is written for the GNOME Shell
+extension to display.
+
+Usage:
+    energy-usage-collector run        # run the collector (systemd user service)
+    energy-usage-collector report     # print the current summary as a table
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+APP_NAME = "energy-usage-overview"
+SAMPLE_INTERVAL = 5.0  # seconds
+NOW_WINDOW = 15.0  # seconds averaged for the "now" view
+MINUTE_RETENTION = 2 * 3600  # seconds
+HOUR_RETENTION = 35 * 24 * 3600  # seconds
+TOP_N = 25
+
+# Used when neither RAPL nor battery discharge readings are available
+# (e.g. on AC power without RAPL access). Very rough laptop defaults; can be
+# overridden with environment variables.
+ESTIMATE_IDLE_W = float(os.environ.get("EUO_ESTIMATE_IDLE_W", "4"))
+ESTIMATE_MAX_W = float(os.environ.get("EUO_ESTIMATE_MAX_W", "45"))
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PF_KTHREAD = 0x00200000
+
+PERIODS = {
+    "hour": 3600,
+    "day": 24 * 3600,
+    "week": 7 * 24 * 3600,
+    "month": 30 * 24 * 3600,
+}
+
+
+def data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / APP_NAME
+
+
+def summary_path() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) / APP_NAME if runtime else data_dir()
+    return base / "summary.json"
+
+
+def read_file(path: str) -> str | None:
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def boottime() -> float:
+    """Clock that keeps running during suspend, to detect sleep gaps."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+# --------------------------------------------------------------------------
+# Power sources
+# --------------------------------------------------------------------------
+
+
+class RaplSource:
+    name = "rapl"
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.label = f"RAPL {read_file(str(path / 'name')).strip()}"
+        max_range = read_file(str(path / "max_energy_range_uj"))
+        self.max_range = int(max_range) if max_range else 2**32
+        self.last = None
+
+    @classmethod
+    def detect(cls):
+        base = Path("/sys/class/powercap")
+        candidates = {}
+        for zone in sorted(base.glob("intel-rapl:*")):
+            if zone.name.count(":") != 1:  # top level zones only
+                continue
+            name = (read_file(str(zone / "name")) or "").strip()
+            if read_file(str(zone / "energy_uj")) is not None:
+                candidates[name] = zone
+        # psys covers the whole platform, package only the CPU package.
+        for preferred in ("psys", "package-0"):
+            if preferred in candidates:
+                return cls(candidates[preferred])
+        return None
+
+    def energy(self, dt: float, cpu_util: float) -> float | None:
+        raw = read_file(str(self.path / "energy_uj"))
+        if raw is None:
+            return None
+        value = int(raw)
+        last, self.last = self.last, value
+        if last is None:
+            return None
+        delta = value - last
+        if delta < 0:
+            delta += self.max_range
+        return delta / 1e6
+
+
+class BatterySource:
+    name = "battery"
+    label = "battery discharge"
+
+    def __init__(self, batteries):
+        self.batteries = batteries
+
+    @classmethod
+    def detect(cls):
+        bats = sorted(Path("/sys/class/power_supply").glob("BAT*"))
+        return cls(bats) if bats else None
+
+    def power(self) -> float | None:
+        """Return discharge power in W, or None when not discharging."""
+        total = 0.0
+        discharging = False
+        for bat in self.batteries:
+            status = (read_file(str(bat / "status")) or "").strip()
+            if status != "Discharging":
+                continue
+            discharging = True
+            p = read_file(str(bat / "power_now"))
+            if p is not None:
+                total += int(p) / 1e6
+                continue
+            i = read_file(str(bat / "current_now"))
+            v = read_file(str(bat / "voltage_now"))
+            if i is not None and v is not None:
+                total += int(i) * int(v) / 1e12
+        return total if discharging and total > 0 else None
+
+    def energy(self, dt: float, cpu_util: float) -> float | None:
+        p = self.power()
+        return p * dt if p is not None else None
+
+
+class EstimateSource:
+    name = "estimate"
+    label = "estimate from CPU load"
+
+    def energy(self, dt: float, cpu_util: float) -> float | None:
+        return (ESTIMATE_IDLE_W + (ESTIMATE_MAX_W - ESTIMATE_IDLE_W) * cpu_util) * dt
+
+
+# --------------------------------------------------------------------------
+# Process accounting
+# --------------------------------------------------------------------------
+
+SCOPE_APP_RE = re.compile(r"^app-(?:gnome|flatpak|kde|xfce|glib|systemd)?-?(.+?)-\d+\.scope$")
+SLICE_APP_RE = re.compile(r"^app-(.+)\.slice$")
+SNAP_RE = re.compile(r"^snap\.([^.]+)\.([^.]+?)(?:-[0-9a-f-]{36})?\.(?:scope|service)$")
+
+
+def unescape_systemd(s: str) -> str:
+    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+
+
+def process_name(pid: str, comm: str) -> str:
+    # comm is truncated to 15 chars and some programs (e.g. Firefox) put
+    # descriptive names with spaces there; prefer the executable then.
+    if len(comm) >= 15 or " " in comm:
+        try:
+            exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+            if exe:
+                return exe.removesuffix(" (deleted)")
+        except OSError:
+            pass
+    return comm
+
+
+def classify(pid: str, comm: str, flags: int) -> tuple[str, str | None]:
+    """Return (application key, desktop file id or None) for a process."""
+    if flags & PF_KTHREAD:
+        return "Kernel", None
+
+    cgroup = read_file(f"/proc/{pid}/cgroup") or ""
+    path = ""
+    for line in cgroup.splitlines():
+        if line.startswith("0::"):
+            path = line[3:]
+            break
+    parts = [unescape_systemd(p) for p in path.split("/") if p]
+    last = parts[-1] if parts else ""
+    parent = parts[-2] if len(parts) > 1 else ""
+
+    # Things started from a terminal (or an ssh session) are grouped by name.
+    if last.startswith("vte-spawn-") or last.startswith("session-") or last.startswith("tmux-spawn-"):
+        return process_name(pid, comm), None
+
+    m = SNAP_RE.match(last)
+    if m:
+        snap, app = m.groups()
+        return snap, f"{snap}_{app}.desktop"
+
+    m = SCOPE_APP_RE.match(last)
+    if m:
+        app_id = m.group(1)
+        return app_id, f"{app_id}.desktop"
+
+    m = SLICE_APP_RE.match(parent)
+    if m and not m.group(1).startswith("gnome-session"):
+        app_id = m.group(1)
+        return app_id, f"{app_id}.desktop"
+
+    return process_name(pid, comm), None
+
+
+class ProcessTracker:
+    def __init__(self):
+        # (pid, starttime) -> cpu ticks at last sample
+        self.last_ticks: dict[tuple[str, str], int] = {}
+        # (pid, starttime, comm) -> (app key, desktop id)
+        self.classification: dict[tuple[str, str, str], tuple[str, str | None]] = {}
+        self.desktop_ids: dict[str, str] = {}
+        self.last_uptime = float("inf")
+
+    def sample(self) -> dict[str, float]:
+        """Return CPU seconds per application since the previous sample."""
+        per_app: dict[str, float] = {}
+        seen_ticks = {}
+        seen_class = {}
+        uptime = float((read_file("/proc/uptime") or "0").split()[0])
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            stat = read_file(f"/proc/{pid}/stat")
+            if not stat:
+                continue
+            lp, rp = stat.find("("), stat.rfind(")")
+            comm = stat[lp + 1 : rp]
+            fields = stat[rp + 2 :].split()
+            # fields[0] is field 3 (state) of proc(5)
+            flags = int(fields[6])
+            ticks = int(fields[11]) + int(fields[12])
+            starttime = fields[19]
+
+            key = (pid, starttime)
+            seen_ticks[key] = ticks
+            prev = self.last_ticks.get(key)
+            if prev is None:
+                # Count processes that started since the previous sample from
+                # their start; anything older is just a new baseline.
+                started_after = int(starttime) / CLK_TCK > self.last_uptime
+                if not started_after:
+                    continue
+                prev = 0
+            delta = ticks - prev
+            if delta <= 0:
+                continue
+
+            ckey = (pid, starttime, comm)
+            cls = self.classification.get(ckey) or classify(pid, comm, flags)
+            seen_class[ckey] = cls
+            app, desktop = cls
+            if desktop:
+                self.desktop_ids[app] = desktop
+            per_app[app] = per_app.get(app, 0.0) + delta / CLK_TCK
+
+        self.last_ticks = seen_ticks
+        self.last_uptime = uptime
+        # Keep the classification cache bounded.
+        self.classification.update(seen_class)
+        if len(self.classification) > 20000:
+            self.classification = seen_class
+        return per_app
+
+
+def read_cpu_times() -> tuple[int, int]:
+    """Return (busy, total) jiffies from /proc/stat."""
+    line = (read_file("/proc/stat") or "").splitlines()[0]
+    values = [int(v) for v in line.split()[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values[:8])
+    return total - idle, total
+
+
+# --------------------------------------------------------------------------
+# Storage
+# --------------------------------------------------------------------------
+
+
+class Store:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
+        self.db.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS minute (
+                ts INTEGER NOT NULL, app TEXT NOT NULL,
+                joules REAL NOT NULL, cpu REAL NOT NULL,
+                PRIMARY KEY (ts, app));
+            CREATE TABLE IF NOT EXISTS hour (
+                ts INTEGER NOT NULL, app TEXT NOT NULL,
+                joules REAL NOT NULL, cpu REAL NOT NULL,
+                PRIMARY KEY (ts, app));
+            CREATE TABLE IF NOT EXISTS total_hour (
+                ts INTEGER PRIMARY KEY,
+                joules REAL NOT NULL, seconds REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS total_minute (
+                ts INTEGER PRIMARY KEY,
+                joules REAL NOT NULL, seconds REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS desktop (
+                app TEXT PRIMARY KEY, desktop_id TEXT NOT NULL);
+            """
+        )
+
+    def add(self, ts: float, per_app: dict[str, tuple[float, float]], total_j: float, seconds: float):
+        minute = int(ts // 60 * 60)
+        hour = int(ts // 3600 * 3600)
+        rows_m = [(minute, app, j, c) for app, (j, c) in per_app.items()]
+        rows_h = [(hour, app, j, c) for app, (j, c) in per_app.items()]
+        upsert = (
+            "INSERT INTO {t} (ts, app, joules, cpu) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (ts, app) DO UPDATE SET "
+            "joules = joules + excluded.joules, cpu = cpu + excluded.cpu"
+        )
+        tot = (
+            "INSERT INTO {t} (ts, joules, seconds) VALUES (?, ?, ?) "
+            "ON CONFLICT (ts) DO UPDATE SET "
+            "joules = joules + excluded.joules, seconds = seconds + excluded.seconds"
+        )
+        with self.db:
+            self.db.executemany(upsert.format(t="minute"), rows_m)
+            self.db.executemany(upsert.format(t="hour"), rows_h)
+            self.db.execute(tot.format(t="total_minute"), (minute, total_j, seconds))
+            self.db.execute(tot.format(t="total_hour"), (hour, total_j, seconds))
+
+    def set_desktop_ids(self, ids: dict[str, str]):
+        with self.db:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO desktop (app, desktop_id) VALUES (?, ?)", ids.items()
+            )
+
+    def prune(self, now: float):
+        with self.db:
+            self.db.execute("DELETE FROM minute WHERE ts < ?", (now - MINUTE_RETENTION,))
+            self.db.execute("DELETE FROM total_minute WHERE ts < ?", (now - MINUTE_RETENTION,))
+            self.db.execute("DELETE FROM hour WHERE ts < ?", (now - HOUR_RETENTION,))
+            self.db.execute("DELETE FROM total_hour WHERE ts < ?", (now - HOUR_RETENTION,))
+
+    def period(self, now: float, seconds: int) -> dict:
+        if seconds <= 3600:
+            table, total_table = "minute", "total_minute"
+            since = now // 60 * 60 - seconds + 60
+        else:
+            table, total_table = "hour", "total_hour"
+            since = now // 3600 * 3600 - seconds + 3600
+        rows = self.db.execute(
+            f"SELECT m.app, SUM(m.joules) AS j, SUM(m.cpu), d.desktop_id FROM {table} m "
+            f"LEFT JOIN desktop d ON d.app = m.app WHERE m.ts >= ? "
+            f"GROUP BY m.app ORDER BY j DESC LIMIT ?",
+            (since, TOP_N),
+        ).fetchall()
+        total_j, covered = self.db.execute(
+            f"SELECT COALESCE(SUM(joules), 0), COALESCE(SUM(seconds), 0) "
+            f"FROM {total_table} WHERE ts >= ?",
+            (since,),
+        ).fetchone()
+        return {
+            "total_joules": total_j,
+            "covered_seconds": covered,
+            "apps": [
+                {"app": app, "desktop_id": desk, "joules": j, "cpu_seconds": cpu}
+                for app, j, cpu, desk in rows
+            ],
+        }
+
+
+# --------------------------------------------------------------------------
+# Collector loop
+# --------------------------------------------------------------------------
+
+
+def write_json_atomic(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def run():
+    store = Store(data_dir() / "energy.sqlite")
+    tracker = ProcessTracker()
+    rapl = RaplSource.detect()
+    battery = BatterySource.detect()
+    estimate = EstimateSource()
+
+    stop = False
+
+    def on_signal(*_):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    print(f"power sources: rapl={rapl.label if rapl else 'unavailable'}, "
+          f"battery={'yes' if battery else 'no'}", flush=True)
+
+    recent: list[tuple[float, float, dict[str, float]]] = []  # (dt, joules, per_app joules)
+    tracker.sample()
+    last_cpu = read_cpu_times()
+    last_bt = boottime()
+    if rapl:
+        rapl.energy(0, 0)
+    last_prune = 0.0
+    last_source = None
+
+    while not stop:
+        time.sleep(SAMPLE_INTERVAL)
+        now_bt = boottime()
+        dt = now_bt - last_bt
+        last_bt = now_bt
+
+        per_app_cpu = tracker.sample()
+        busy, total = read_cpu_times()
+        d_total = total - last_cpu[1]
+        cpu_util = (busy - last_cpu[0]) / d_total if d_total > 0 else 0.0
+        last_cpu = (busy, total)
+
+        rapl_j = rapl.energy(dt, cpu_util) if rapl else None
+
+        if dt > 3 * SAMPLE_INTERVAL:
+            # System was suspended (or we were stalled); skip this interval.
+            recent.clear()
+            continue
+
+        source = None
+        joules = None
+        if rapl_j is not None:
+            source, joules = rapl, rapl_j
+        if joules is None and battery:
+            joules = battery.energy(dt, cpu_util)
+            source = battery if joules is not None else None
+        if joules is None:
+            source, joules = estimate, estimate.energy(dt, cpu_util)
+        last_source = source
+
+        cpu_sum = sum(per_app_cpu.values())
+        if cpu_sum > 0:
+            per_app = {app: (joules * c / cpu_sum, c) for app, c in per_app_cpu.items()}
+        else:
+            per_app = {"(idle)": (joules, 0.0)}
+
+        ts = time.time()
+        store.add(ts, per_app, joules, dt)
+        if tracker.desktop_ids:
+            store.set_desktop_ids(tracker.desktop_ids)
+            tracker.desktop_ids = {}
+
+        recent.append((dt, joules, {a: j for a, (j, _) in per_app.items()}))
+        while sum(r[0] for r in recent) > NOW_WINDOW and len(recent) > 1:
+            recent.pop(0)
+
+        if ts - last_prune > 600:
+            store.prune(ts)
+            last_prune = ts
+
+        write_json_atomic(summary_path(), build_summary(store, ts, recent, last_source))
+
+
+def build_summary(store: Store, ts: float, recent, source) -> dict:
+    window = sum(r[0] for r in recent) or 1.0
+    now_apps: dict[str, float] = {}
+    for _, _, apps in recent:
+        for app, j in apps.items():
+            now_apps[app] = now_apps.get(app, 0.0) + j
+    total_now = sum(r[1] for r in recent)
+    desktop = dict(store.db.execute("SELECT app, desktop_id FROM desktop").fetchall())
+    top_now = sorted(now_apps.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N]
+
+    periods = {
+        "now": {
+            "total_joules": total_now,
+            "covered_seconds": window,
+            "apps": [
+                {"app": a, "desktop_id": desktop.get(a), "joules": j, "cpu_seconds": None}
+                for a, j in top_now
+            ],
+        }
+    }
+    for name, seconds in PERIODS.items():
+        periods[name] = store.period(ts, seconds)
+        periods[name]["seconds"] = seconds
+    periods["now"]["seconds"] = window
+
+    return {
+        "version": 1,
+        "updated": ts,
+        "interval": SAMPLE_INTERVAL,
+        "source": source.name if source else None,
+        "source_label": source.label if source else None,
+        "power_watts": total_now / window,
+        "periods": periods,
+    }
+
+
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
+
+
+def fmt_energy(j: float) -> str:
+    wh = j / 3600
+    if wh >= 1000:
+        return f"{wh / 1000:.2f} kWh"
+    if wh >= 1:
+        return f"{wh:.1f} Wh"
+    return f"{wh * 1000:.0f} mWh"
+
+
+def report(args):
+    try:
+        data = json.loads(summary_path().read_text())
+    except (OSError, ValueError):
+        print(f"No summary at {summary_path()} - is the collector running?", file=sys.stderr)
+        return 1
+    age = time.time() - data["updated"]
+    print(f"Power now: {data['power_watts']:.1f} W  (source: {data['source_label']}, "
+          f"updated {age:.0f}s ago)")
+    for name in ("now", *PERIODS):
+        p = data["periods"][name]
+        total = p["total_joules"] or 1
+        print(f"\n== {name} ==  total {fmt_energy(p['total_joules'])}")
+        for app in p["apps"][: args.top]:
+            j = app["joules"]
+            val = f"{j / p['covered_seconds']:.2f} W" if name == "now" else fmt_energy(j)
+            print(f"  {app['app'][:40]:<40} {val:>10}  {100 * j / total:5.1f}%")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run", help="run the collector")
+    rp = sub.add_parser("report", help="print the current summary")
+    rp.add_argument("--top", type=int, default=10)
+    args = parser.parse_args()
+    if args.cmd == "run":
+        run()
+        return 0
+    return report(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

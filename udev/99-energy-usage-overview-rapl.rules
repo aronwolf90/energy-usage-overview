@@ -1,0 +1,6 @@
+# Optional: make Intel RAPL energy counters readable by all users so the
+# collector can measure CPU/platform power directly (also on AC power).
+# Note: these counters were restricted to root because of the "Platypus"
+# power side-channel attack (CVE-2020-8694). Only install this if you accept
+# that trade-off on your machine.
+ACTION=="add", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", RUN+="/bin/chmod a+r /sys%p/energy_uj"
