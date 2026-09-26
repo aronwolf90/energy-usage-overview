@@ -189,7 +189,7 @@ class EnergyIndicator extends PanelMenu.Button {
     _updatePanel() {
         const show = this._settings.get_boolean('show-power-label');
         this._label.visible = show;
-        if (this._isStale())
+        if (this._isStale() || this._summary.power_watts === null)
             this._label.text = '–';
         else
             this._label.text = formatWatts(this._summary.power_watts);
@@ -235,10 +235,15 @@ class EnergyIndicator extends PanelMenu.Button {
         const period = summary.periods[this._period];
         const isNow = this._period === 'now';
 
-        this._headerLabel.text = isNow
-            ? `Using ${formatWatts(summary.power_watts)} right now`
-            : `${formatEnergy(period.total_joules)} used ${PERIOD_TITLES[this._period]}`;
-        this._subtitleLabel.text = `Measured via ${summary.source_label}`;
+        if (!isNow)
+            this._headerLabel.text = `${formatEnergy(period.total_joules)} used ${PERIOD_TITLES[this._period]}`;
+        else if (summary.power_watts === null)
+            this._headerLabel.text = 'Measuring…';
+        else
+            this._headerLabel.text = `Using ${formatWatts(summary.power_watts)} right now`;
+        this._subtitleLabel.text = summary.source_label
+            ? `Measured via ${summary.source_label}`
+            : 'Waiting for the first measurement';
 
         const entries = this._settings.get_int('entries');
         const apps = period.apps.slice(0, entries);
@@ -253,7 +258,9 @@ class EnergyIndicator extends PanelMenu.Button {
         for (const app of apps)
             this._listSection.addMenuItem(this._createRow(app, period, total, max, isNow));
 
-        if (isNow) {
+        if (isNow && period.covered_seconds === 0) {
+            this._footer.label.text = 'First sample in a few seconds';
+        } else if (isNow) {
             this._footer.label.text =
                 `Average over the last ${Math.round(period.covered_seconds)} s`;
         } else if (period.covered_seconds < period.seconds * 0.95) {

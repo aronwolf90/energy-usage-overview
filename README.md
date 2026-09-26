@@ -23,7 +23,8 @@ There are two parts:
      Programs started from a terminal are grouped by process name.
 
   Data is kept in `~/.local/share/energy-usage-overview/energy.sqlite`: per-minute
-  rows for 2 hours and per-hour rows for 35 days. A summary is written to
+  rows for 2 hours and per-hour rows for 35 days, so the history survives
+  restarts and reboots (only the "now" view starts fresh). A summary is written to
   `$XDG_RUNTIME_DIR/energy-usage-overview/summary.json`.
 
 - **`extension/`**: the GNOME Shell extension (GNOME 45+). It reads the summary,

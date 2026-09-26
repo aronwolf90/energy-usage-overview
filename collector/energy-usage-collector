@@ -347,6 +347,11 @@ class Store:
             self.db.execute(tot.format(t="total_minute"), (minute, total_j, seconds))
             self.db.execute(tot.format(t="total_hour"), (hour, total_j, seconds))
 
+    def close(self):
+        with self.db:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.db.close()
+
     def set_desktop_ids(self, ids: dict[str, str]):
         with self.db:
             self.db.executemany(
@@ -421,6 +426,9 @@ def run():
           f"battery={'yes' if battery else 'no'}", flush=True)
 
     recent: list[tuple[float, float, dict[str, float]]] = []  # (dt, joules, per_app joules)
+    # Publish the persisted history right away so the extension shows it
+    # directly after login instead of waiting for the first sample.
+    write_json_atomic(summary_path(), build_summary(store, time.time(), recent, None))
     tracker.sample()
     last_cpu = read_cpu_times()
     last_bt = boottime()
@@ -481,9 +489,11 @@ def run():
 
         write_json_atomic(summary_path(), build_summary(store, ts, recent, last_source))
 
+    store.close()
+
 
 def build_summary(store: Store, ts: float, recent, source) -> dict:
-    window = sum(r[0] for r in recent) or 1.0
+    window = sum(r[0] for r in recent)
     now_apps: dict[str, float] = {}
     for _, _, apps in recent:
         for app, j in apps.items():
@@ -513,7 +523,7 @@ def build_summary(store: Store, ts: float, recent, source) -> dict:
         "interval": SAMPLE_INTERVAL,
         "source": source.name if source else None,
         "source_label": source.label if source else None,
-        "power_watts": total_now / window,
+        "power_watts": total_now / window if window > 0 else None,
         "periods": periods,
     }
 
@@ -539,15 +549,18 @@ def report(args):
         print(f"No summary at {summary_path()} - is the collector running?", file=sys.stderr)
         return 1
     age = time.time() - data["updated"]
-    print(f"Power now: {data['power_watts']:.1f} W  (source: {data['source_label']}, "
-          f"updated {age:.0f}s ago)")
+    if data["power_watts"] is None:
+        print(f"Power now: measuring...  (updated {age:.0f}s ago)")
+    else:
+        print(f"Power now: {data['power_watts']:.1f} W  (source: {data['source_label']}, "
+              f"updated {age:.0f}s ago)")
     for name in ("now", *PERIODS):
         p = data["periods"][name]
         total = p["total_joules"] or 1
         print(f"\n== {name} ==  total {fmt_energy(p['total_joules'])}")
         for app in p["apps"][: args.top]:
             j = app["joules"]
-            val = f"{j / p['covered_seconds']:.2f} W" if name == "now" else fmt_energy(j)
+            val = f"{j / (p['covered_seconds'] or 1):.2f} W" if name == "now" else fmt_energy(j)
             print(f"  {app['app'][:40]:<40} {val:>10}  {100 * j / total:5.1f}%")
     return 0
 
