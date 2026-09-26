@@ -1,5 +1,7 @@
 # Energy Usage Overview
 
+> **Note:** This is a hobby project to experiment with vibe coding.
+
 A GNOME Shell extension that shows which programs use the most energy right
 now and over the last hour, day, week and month.
 
