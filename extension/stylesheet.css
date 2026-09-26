@@ -42,6 +42,11 @@
   min-width: 70px;
 }
 
+.euo-row-avg {
+  font-size: 0.8em;
+  color: #999;
+}
+
 .euo-row-percent {
   font-size: 0.85em;
   color: #999;

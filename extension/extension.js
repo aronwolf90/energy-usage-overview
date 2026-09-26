@@ -235,15 +235,21 @@ class EnergyIndicator extends PanelMenu.Button {
         const period = summary.periods[this._period];
         const isNow = this._period === 'now';
 
-        if (!isNow)
-            this._headerLabel.text = `${formatEnergy(period.total_joules)} used ${PERIOD_TITLES[this._period]}`;
-        else if (summary.power_watts === null)
-            this._headerLabel.text = 'Measuring…';
-        else
-            this._headerLabel.text = `Using ${formatWatts(summary.power_watts)} right now`;
-        this._subtitleLabel.text = summary.source_label
+        const via = summary.source_label
             ? `Measured via ${summary.source_label}`
             : 'Waiting for the first measurement';
+        if (!isNow) {
+            this._headerLabel.text = `${formatEnergy(period.total_joules)} used ${PERIOD_TITLES[this._period]}`;
+            const avg = period.covered_seconds > 0
+                ? formatWatts(period.total_joules / period.covered_seconds)
+                : null;
+            this._subtitleLabel.text = avg ? `${avg} on average · ${via}` : via;
+        } else {
+            this._headerLabel.text = summary.power_watts === null
+                ? 'Measuring…'
+                : `Using ${formatWatts(summary.power_watts)} right now`;
+            this._subtitleLabel.text = via;
+        }
 
         const entries = this._settings.get_int('entries');
         const apps = period.apps.slice(0, entries);
@@ -267,8 +273,7 @@ class EnergyIndicator extends PanelMenu.Button {
             this._footer.label.text =
                 `Data available for ${formatDuration(period.covered_seconds)} of this period`;
         } else {
-            const avg = period.total_joules / period.covered_seconds;
-            this._footer.label.text = `Average ${formatWatts(avg)} while running`;
+            this._footer.label.text = 'Averages are over the whole period';
         }
     }
 
@@ -298,14 +303,30 @@ class EnergyIndicator extends PanelMenu.Button {
         nameBox.add_child(trough);
         row.add_child(nameBox);
 
-        const value = isNow
-            ? formatWatts(app.joules / period.covered_seconds)
-            : formatEnergy(app.joules);
-        row.add_child(new St.Label({
-            text: value,
-            style_class: 'euo-row-value',
-            y_align: Clutter.ActorAlign.CENTER,
-        }));
+        if (isNow) {
+            row.add_child(new St.Label({
+                text: formatWatts(app.joules / period.covered_seconds),
+                style_class: 'euo-row-value',
+                y_align: Clutter.ActorAlign.CENTER,
+            }));
+        } else {
+            // Energy used in the period, with the average power underneath.
+            const valueBox = new St.BoxLayout({
+                vertical: true,
+                style_class: 'euo-row-value',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            valueBox.add_child(new St.Label({
+                text: formatEnergy(app.joules),
+                x_align: Clutter.ActorAlign.END,
+            }));
+            valueBox.add_child(new St.Label({
+                text: formatWatts(app.joules / (period.covered_seconds || 1)),
+                style_class: 'euo-row-avg',
+                x_align: Clutter.ActorAlign.END,
+            }));
+            row.add_child(valueBox);
+        }
         row.add_child(new St.Label({
             text: `${Math.round(100 * app.joules / total)}%`,
             style_class: 'euo-row-percent',
