@@ -2,7 +2,7 @@
   "uuid": "energy-usage-overview@aronwolf90.github.io",
   "name": "Energy Usage Overview",
   "description": "Shows which programs use the most energy right now and over the last hour, day, week and month. Requires the energy-usage-collector user service.",
-  "shell-version": ["45", "46", "47", "48", "49"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "settings-schema": "org.gnome.shell.extensions.energy-usage-overview",
   "url": "https://github.com/aronwolf90/energy-usage-overview",
   "version": 1
